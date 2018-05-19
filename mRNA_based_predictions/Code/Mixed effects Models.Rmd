@@ -1,0 +1,30 @@
+---
+title: "Mixed Effects Models"
+author: "Abdullah Farouk"
+date: '2018-04-12'
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load Libraries
+```{r}
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+```
+
+
+## Fitting a Mixed Effects Model
+```{r}
+library(lme4)
+
+dat <- read.csv("http://www.bodowinter.com/tutorial/politeness_data.csv")
+
+politeness.model <- lmer(frequency ~ attitude + (1|subject) + (1|scenario), data=dat)
+
+summary(politeness.model)
+```
+It seems that we may need to melt our dataset to get it in the correct form for lme4. Thus we require the following

@@ -1,0 +1,413 @@
+---
+title: "Predicting Protein levels using leveles of mRNA in Tissue Samples"
+author: "Abdullah Farouk"
+date: '2018-04-08'
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Load Libraries
+```{r}
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(readxl)
+```
+
+# Read Data in 
+```{r}
+mRNA <- read_excel('tpm.xlsx')
+
+protein_copy_number <- read_excel('protein_copy_numbers.xlsx')
+
+conversion_factor <- read_excel('conversion_factor.xlsx')
+
+```
+
+
+# Remove the first 4 columns, corresponding to the order they are displayed in Figure 2A
+```{r}
+fig_cols <- c('HEK293/Kidney',	'HepG2/Liver', 'Lung/A549',	'Breast/MCF7')
+
+protein_copy_number <- protein_copy_number %>% 
+  select(-one_of(fig_cols))
+
+dim(protein_copy_number) == dim(mRNA)
+
+conversion_factor <- conversion_factor %>% 
+  select(-one_of(c('X__1', 'X__2')))
+
+
+```
+
+
+
+# Convert protein counts and conversion factor datasets into a numeric arguement
+```{r, warning=FALSE, message=FALSE}
+protein_copy_number[,2:21] <- sapply(protein_copy_number[,2:21], function(x) as.numeric(as.character(x)))
+
+conversion_factor[,2:22] <- sapply(conversion_factor[,2:22], function(x) as.numeric(as.character(x)))
+
+#Convert genes into factors
+mRNA$Gene <- mRNA$Gene %>% as.factor()
+
+protein_copy_number$Gene <- protein_copy_number$Gene %>% as.factor()
+
+colnames(conversion_factor)[1] <- 'Gene'
+
+conversion_factor$Gene <- conversion_factor$Gene %>% as.factor()
+
+str(mRNA)
+
+str(protein_copy_number)
+
+str(conversion_factor)
+```
+
+
+# Convert data into long form (for graphing and mixed effects model fitting)
+```{r}
+conversion_factor_long <- gather(conversion_factor[,-2], key = 'Tissue', value = 'RTP', -'Gene')
+
+protein_copy_number_long <- gather(protein_copy_number, key = 'Tissue', value = 'Protein_copy_number', -'Gene')
+
+#Convert protein copy numbers to actual levels
+protein_copy_number_long$Protein_copy_number <- protein_copy_number_long$Protein_copy_number*1000
+
+mRNA_long <- gather(mRNA, key = 'Tissue', value = 'TPM', -'Gene')
+
+#Arrange data by Gene
+conversion_factor_long <- conversion_factor_long %>% arrange(Gene)
+
+protein_copy_number_long <- protein_copy_number_long %>% arrange(Gene)
+
+mRNA_long <- mRNA_long %>% arrange(Gene)
+
+```
+
+
+
+# EDA
+```{r, warning=FALSE, message=FALSE}
+#Check if conversion factor is constant across tissues
+set.seed(10)
+
+gene_levels <- conversion_factor$Gene[sample(length(conversion_factor$Gene), 3)] %>% as.character()
+
+one <- conversion_factor_long %>% 
+  filter(Gene %in% gene_levels) 
+
+one <- one %>% 
+  ggplot(aes(x = Tissue, y = RTP, colour = Tissue)) + 
+  geom_point() +
+  labs(title = "mRNA To Protein (RTP) Ratio for 3 Ranomly Selected Genes", x = "Tissue/Cell Line", y = "RTP") + 
+  facet_wrap(~Gene, scales = 'free') +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1), plot.title = element_text(hjust = 0.5), legend.position = 'none')
+
+ggsave(one, filename = 'onegene.png')
+
+bp <- ggplot(conversion_factor_long, aes(x = Tissue, y = RTP, colour = Tissue)) + 
+  geom_boxplot() + 
+  labs(title = "mRNA To Protein (RTP) Ratio across Tissue/Cell Lines", x = "Tissue/Cell Line", y = "RTP") + 
+  theme_light() +
+  scale_fill_brewer(palette="Dark2") + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1), plot.title = element_text(hjust = 0.5), legend.position = 'none')
+
+bp
+ggsave(bp, file="boxplot.png")
+```
+
+
+# Construct dataset to fit mixed effects model
+```{r}
+data_comb <- conversion_factor_long
+
+#Calculate median RTP values by leaving that specific tissue out
+gene_levels <- data_comb$Gene
+
+
+for(i in 1:length(gene_levels)) {
+  
+    x <- data_comb %>% filter(Gene == gene_levels[i])
+    
+    data_comb$medianrtp[i] <- median(x$RTP[-i], na.rm = TRUE)
+    
+}
+
+#Divide median RTP by 1000 to get sensible predictions
+data_comb$medianrtp <- data_comb$medianrtp
+
+data_comb$TPM <- mRNA_long$TPM
+
+#Convert protein copy numbers to actual levels
+data_comb$protein <- protein_copy_number_long$Protein_copy_number
+
+data_comb$predicted_protein <- data_comb$medianrtp*data_comb$TPM
+
+```
+
+
+
+# Look at whether a random slope and intercept is needed for each gene
+```{r, warning=FALSE, message=FALSE}
+set.seed(9)
+
+# Plot protein vs MRNA values for 8 randomly selected Genes
+gene_names <- conversion_factor$Gene[sample(length(conversion_factor$Gene), 9)] %>% as.character()
+
+plot_data <- data_comb %>% filter(Gene %in% gene_names)
+
+fp <- plot_data %>% 
+  ggplot(aes(x = TPM, y = protein, group = Gene, colour = Gene)) + 
+  geom_point() + 
+  geom_jitter() +
+  geom_smooth(method = "lm", se = FALSE) + 
+  facet_wrap(~Gene, scales = 'free') + 
+  labs(title = "Protein vs mRNA levels for 9 Randomly selected Genes", x = "mRNA Levels", y = "Protein Levels") + 
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1), plot.title = element_text(hjust = 0.5), legend.position = 'none')
+
+fp
+ggsave(fp, file="facetplot.png")
+```
+
+
+# Fit a mixed effects model
+```{r}
+library('lme4')
+
+data_comb_scaled <- data_comb
+
+data_comb_scaled[,5:7] <- scale(data_comb[, 5:7], center = TRUE, scale = TRUE)
+
+fit <- lmer(protein ~ TPM + (1+TPM|Gene), data = data_comb_scaled, REML=FALSE) #Add REML=FALSE when performing likelihood ratio tests
+summary(fit)
+```
+
+
+# Interpret results from the model
+```{r}
+#Reduced model
+null_fit <- lmer(protein ~ (1+TPM|Gene), data = data_comb_scaled, REML=FALSE)
+
+anova(fit, null_fit)
+```
+
+# Check correlations between predicted and observed protein levels
+```{r, message=FALSE, warning=FALSE}
+#Check if conversion factor is constant across tissues
+set.seed(13)
+
+gene_levels <- data_comb$Gene[sample(length(data_comb$Gene), 6)] %>% as.character()
+
+comp <- data_comb %>% 
+  filter(Gene %in% gene_levels) 
+
+comp <- comp %>% 
+  ggplot(aes(x = predicted_protein, y = protein, colour = Gene)) + 
+  geom_point() +
+  labs(title = "Correlation between Observed and Predicted Protein levels", x = "Predicted Protein Levels", x = "Predicted Protein Levels", y = "Observed Protein Levels") + 
+  facet_wrap(~Gene, scales = 'free') +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1), plot.title = element_text(hjust = 0.5), legend.position = 'none') +
+  annotate("segment", x=-Inf, xend=Inf,y=-Inf, yend=Inf, linetype = 2)
+
+ggsave(comp, filename = 'comp.png')
+
+# pp <- data_comb %>% 
+#   ggplot(aes(x = predicted_protein, y = protein, colour = Gene, group = Gene)) +
+#   geom_point() +
+#   geom_jitter() +
+#   labs(title = "Correlation between Observed and Predicted Protein levels", x = "Predicted Protein Levels", y = "Observed Protein Levels") +
+#   theme_light()+
+#   theme(legend.position = 'none', plot.title = element_text(hjust = 0.5))
+# 
+# pp
+# ggsave(pp, file="predictioncomp.png")
+
+#Check correlations
+gene_levels <- levels(data_comb$Gene)
+
+correlations <- c()
+
+for(i in 1:length(gene_levels)) {
+  
+    x <- data_comb %>% filter(Gene %in% gene_levels[i])
+    
+    correlations[i] <- cor(x = x$predicted_protein, y = x$protein, use = 'everything', method = 'spearman')
+    
+}
+
+w <- na.omit(correlations)
+
+
+cor(x = data_comb$protein, y = data_comb$TPM, use = 'complete.obs', method = 'spearman')
+```
+
+
+# Check if protein levels vary across genes and across Tissues
+```{r}
+bp_tissue <- ggplot(data_comb, aes(x = Tissue, y = protein, colour = Tissue, group = Tissue)) + 
+  geom_boxplot() + 
+  labs(title = "Protein levels across Tissue/Cell Lines", x = "Tissue/Cell Line", y = "Protein Levels") + 
+  theme_light() +
+  scale_fill_brewer(palette="Dark2") + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1), plot.title = element_text(hjust = 0.5), legend.position = 'none')
+
+bp_tissue
+ggsave(bp_tissue, file="boxplottissue.png")
+
+#Now check for genes
+bp_gene <- ggplot(data_comb, aes(x = Gene, y = protein, colour = Gene)) + 
+  geom_boxplot() + 
+  labs(title = "Protein levels across Genes", x = "Gene", y = "Protein Levels") + 
+  theme_light() +
+  scale_fill_brewer(palette="Dark2") + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1), plot.title = element_text(hjust = 0.5), legend.position = 'none')
+
+bp_gene
+#ggsave(bp_gene, file="boxplotgene.png")
+```
+
+
+# Check correlations between mRNA and protein levels across genes
+```{r}
+# plot(conversion_factor[5,3:22])
+#Check if conversion factor is constant across tissue samples
+# boxplot(conversion_factor[,3:22])
+# 
+# hist(as.numeric(t(conversion_factor[ ,2])))
+# 
+# conversion_factor_complete <- na.omit(conversion_factor)
+# 
+# hist(as.numeric(conversion_factor_complete[sample(1:17,1), 3:22]))
+# 
+# #Check if mrna and protein levels are normally distributed
+# hist(as.numeric(mRNA[3, ]))
+# 
+# hist(as.numeric(protein_copy_number[sample(1:55,1), ]))
+# 
+# #check to see how gene-specific conversion factors are computed
+# rtp_factor <- protein_copy_number$A431 * 1000 / mRNA$A431
+# 
+# protein_complete <- na.omit(protein_copy_number)
+# 
+# #Find these genes in the mRNA dataframe
+# 
+# mrna_complete <- mRNA[which(mRNA$Gene %in% protein_complete$Gene), ]
+# 
+# #Try and verify findings in the article
+# spearman_corr <- cor(x = mrna_complete[, 2:21], y = protein_complete[, 2:21], method = 'spearman')
+# 
+# pearson_corr <- cor(x = mrna_complete[, 2:21], y = protein_complete[, 2:21], method = "pearson")
+# 
+# #Compute mean correlations across genes
+# avg_spearman_corr <- colMeans(spearman_corr)
+
+```
+
+# Visualize correlations
+```{r}
+# protein_and_rna <- cbind(mRNA, protein_copy_number[, 2:21])
+# 
+# protein_and_rna <- na.omit(protein_and_rna)
+# 
+# plot(x = protein_and_rna[, 2], y = protein_and_rna[, 22])
+# 
+# protein_and_rna %>% 
+#   ggplot(aes(x = protein_and_rna[, 2], y = protein_and_rna[, 22], colour = protein_and_rna[,1])) +
+#   geom_point() +
+#   xlab("mRNA levels") + ylab("Protein Copy levels")
+# 
+# cor(x = protein_and_rna[, 2], y = protein_and_rna[, 22], method = "spearman")
+
+```
+
+
+# Visualize correlations across tissues
+```{r}
+#Have Genes along the columns
+# protein_complete_1 <- t(protein_copy_number)
+# 
+# protein_complete_1 <- protein_complete_1[-1, ]
+# 
+# protein_complete_1 <- mapply(protein_complete_1, FUN=as.numeric)
+# 
+# protein_complete_1 <- matrix(data = protein_complete_1, ncol = 55, nrow = 20)
+# 
+# #Label its columns and rows
+# colnames(protein_complete_1) <- protein_copy_number$Gene
+# 
+# rownames(protein_complete_1) <- colnames(protein_copy_number[,2:21])
+# 
+# str(protein_complete_1)
+# 
+# #Do the same with mrna data
+# mrna_complete_1 <- t(mRNA)
+# 
+# mrna_complete_1 <- mrna_complete_1[-1, ]
+# 
+# mrna_complete_1 <- mapply(mrna_complete_1, FUN=as.numeric)
+# 
+# mrna_complete_1 <- matrix(data = mrna_complete_1, ncol = 55, nrow = 20)
+
+#Label its columns and rows
+# colnames(mrna_complete_1) <- mRNA$Gene
+# 
+# rownames(mrna_complete_1) <- colnames(mRNA[,2:21])
+# 
+# str(mrna_complete_1)
+# 
+# #Do the same with conversion factors
+# rtp_1 <- conversion_factor[,-2]
+# 
+# rtp_1 <- t(conversion_factor)
+# 
+# rtp_1 <- rtp_1[-1, ]
+# 
+# rtp_1 <- mapply(rtp_1, FUN=as.numeric)
+# 
+# rtp_1 <- matrix(data = rtp_1, ncol = 55, nrow = 20)
+
+#Label its columns and rows
+# colnames(rtp_1) <- conversion_factor$Gene
+# 
+# rownames(rtp_1) <- colnames(conversion_factor[,3:22])
+# 
+# str(rtp_1)
+# 
+# boxplot(rtp_1)
+```
+
+
+
+# Check for correlations across tissues now
+```{r}
+#Try and verify findings in the article
+# spearman_corr_gene <- cor(x = mrna_complete_1, y = protein_complete_1, method = 'spearman')
+# 
+# pearson_corr_gene <- cor(x = mrna_complete_1, y = protein_complete_1, method = "pearson")
+# 
+# average_spearman_corr_across_tissues <- colMeans(spearman_corr_gene)
+# 
+# average_pearson_corr_across_tissues <- colMeans(pearson_corr_gene)
+# 
+# #Visualize them
+# protein_and_rna_1 <- as.data.frame(cbind(mrna_complete_1, protein_complete_1))
+# 
+# protein_and_rna_1 %>% 
+#   ggplot(aes(x = protein_and_rna_1[, 1], y = protein_and_rna_1[, 18], colour = rownames(protein_and_rna_1))) +
+#   geom_point() +
+#   xlab("Gene ANXA1 mRNA levels") + ylab("Gene ANXA1 Protein Copy levels")
+# 
+# cor(x = protein_and_rna[, 2], y = protein_and_rna[, 22], method = "spearman")
+
+
+```
+
+
